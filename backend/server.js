@@ -4,7 +4,21 @@ import {Firestore} from '@google-cloud/firestore';
 import {Storage} from '@google-cloud/storage';
 import {GoogleGenAI} from '@google/genai';
 
-const {BUCKET, MODEL = 'gemini-2.5-flash', GEMINI_API_KEY} = process.env;
+const {BUCKET, MODEL = 'gemini-3.8-flash', GEMINI_API_KEY} = process.env;
+const PIPELINE_VERSION = 'transcript-evidence-v3';
+const MAX_CLAIMS = 5;
+const MODELS = new Set([
+  'gemini-3.8-flash',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.5-flash-lite-preview',
+  'gemini-3.1-flash-lite-preview',
+  'gemini-3-flash-preview',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+]);
+const inFlight = new Map();
 const db = new Firestore(), gcs = new Storage();
 const app = express(); app.disable('x-powered-by'); app.use(express.json({limit: '50kb'}));
 app.use((_, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); next(); });
@@ -19,15 +33,14 @@ for (const m of ['get', 'post']) {
 const hash = b => crypto.createHash('sha256').update(b).digest('hex').slice(0, 16);
 const keyOf = req => req.get('x-ai-key') || GEMINI_API_KEY; // user key wins; server key is only a fallback
 const clientFor = req => { const k = keyOf(req); return k ? new GoogleGenAI(req.get('x-ai-provider') === 'vertex' ? {vertexai: true, apiKey: k} : {apiKey: k}) : null; };
+const modelOf = req => {
+  const requested = req.get('x-ai-model');
+  return requested ? (MODELS.has(requested) ? requested : null) : MODEL;
+};
 const clean = (e, k) => { let m = String(e?.message || e); if (k) m = m.split(k).join('***'); return m.slice(0, 300); };
 const PUB = `https://storage.googleapis.com/${BUCKET}/`; // legacy posts stored a public URL
 const nameOf = p => p.gcsName || (p.videoUrl?.startsWith(PUB) ? decodeURIComponent(p.videoUrl.slice(PUB.length)) : null);
 
-const AGENTS = {
-  health: 'You are a medical fact-checking specialist. Prefer WHO, CDC, NHS, Cochrane, PubMed.',
-  engineering: 'You are an engineering/physics fact-checking specialist. Prefer standards bodies, textbooks, peer-reviewed papers, .edu/.gov sources.',
-  general: 'You are a general fact-checking specialist. Prefer primary sources, major fact-checkers and reputable news.'
-};
 const VERDICTS = 'Supported | Contradicted | Misleading | Mixed | Insufficient Evidence';
 
 async function toPart(src) {
@@ -37,26 +50,95 @@ async function toPart(src) {
   return {inlineData: {mimeType: src.mime === 'video/quicktime' ? 'video/mov' : src.mime, data: b.toString('base64')}};
 }
 
-async function analyse(ai, src) {
-  const run = (parts, config = {}) => ai.models.generateContent({model: MODEL, contents: [{role: 'user', parts}], config});
-  const json = async parts => JSON.parse((await run(parts, {responseMimeType: 'application/json'})).text);
-  const ext = await json([await toPart(src), {text: 'Watch this content. Extract up to 5 checkable factual claims (ignore opinions). If there are none, return an empty claims array. Return JSON: {"creator":string,"title":string,"claims":[{"text":string,"category":"health"|"engineering"|"general"}]}'}]);
-  if (!ext.claims?.length) return {verdict: 'Insufficient Evidence', confidence: 0, explanation: 'No checkable factual claims were found in this content.', claims: [], sources: [], misleading: [], nextSteps: [], limitations: 'Nothing to verify.', creator: ext.creator, title: ext.title};
-  const sources = new Map(), evidence = [];
-  for (const cat of Object.keys(AGENTS)) {
-    const cl = ext.claims.filter(c => (AGENTS[c.category] ? c.category : 'general') === cat);
-    if (!cl.length) continue;
-    const r = await run([{text: `${AGENTS[cat]}\nUse search. For each claim, state what reliable sources say and whether they support, contradict or leave it unresolved.\nClaims:\n${cl.map((c, i) => `${i + 1}. ${c.text}`).join('\n')}`}], {tools: [{googleSearch: {}}]});
-    (r.candidates?.[0]?.groundingMetadata?.groundingChunks || []).forEach(g => g.web && sources.set(g.web.uri, g.web.title || g.web.uri));
-    evidence.push(`[${cat}]\n${r.text}`);
-  }
-  const rep = await json([{text: `Using ONLY this evidence, judge the claims. If evidence is thin, say Insufficient Evidence.\nClaims: ${JSON.stringify(ext.claims)}\nEvidence:\n${evidence.join('\n\n')}\nReturn JSON: {"verdict":one of [${VERDICTS}],"confidence":0-100 (strength of the assessment, not probability the claim is true),"explanation":string,"claims":[{"text":string,"verdict":one of [${VERDICTS}],"explanation":string}],"misleading":[short strings describing misleading framing, omissions or manipulation; empty if none],"nextSteps":[2-3 short recommended actions for the viewer],"limitations":string}`}]);
-  return {...rep, creator: ext.creator, title: ext.title, sources: [...sources].map(([uri, title]) => ({uri, title}))};
+function parseJsonResponse(response) {
+  const raw = response?.text;
+  if (!raw) throw new Error('The AI returned an empty response. Please try again.');
+  try { return JSON.parse(raw); }
+  catch { throw new Error('The AI returned an invalid structured response. Please retry.'); }
 }
 
-async function job(id, ai, src, meta, k) {
-  try { const r = await analyse(ai, src); await db.doc(`reports/${id}`).set({...r, ...meta, id, status: 'done', updatedAt: Date.now()}); }
-  catch (e) { const m = clean(e, k); console.error(m); await db.doc(`reports/${id}`).set({id, ...meta, status: 'error', error: m, updatedAt: Date.now()}); }
+function isQuotaError(e) {
+  const s = `${e?.status || ''} ${e?.code || ''} ${e?.message || ''}`.toLowerCase();
+  return /429|resource_exhausted|rate.?limit|quota/.test(s);
+}
+
+function publicAiError(e, key) {
+  if (isQuotaError(e)) return 'Gemini quota/rate limit reached. Check RPM and daily request limits, wait for the quota reset, or use a project with available quota.';
+  const status = Number(e?.status || e?.code);
+  if (status === 401 || status === 403) return 'The AI key or provider configuration was rejected. Check the key, enabled API, project and billing settings.';
+  return clean(e, key);
+}
+
+async function generate(ai, model, contents, config = {}) {
+  // Deliberately do not auto-retry 429s: daily/project quota errors will not be fixed by retrying,
+  // and retries consume more requests against the user's tight RPM/RPD limits.
+  return ai.models.generateContent({model, contents, config: {candidateCount: 1, ...config}});
+}
+
+async function analyse(ai, src, model) {
+  // Call 1: prioritize spoken words. Video is supplied to Gemini because this app currently has
+  // no dedicated speech-to-text/FFmpeg stage; the prompt tells the model not to infer claims from
+  // visuals. Visual-only claims are deferred rather than guessed.
+  const media = await toPart(src);
+  const extResponse = await generate(ai, model, [{role: 'user', parts: [media, {text:
+    `TRANSCRIPT-FIRST VIDEO REVIEW. Return a best-effort near-verbatim transcript of audible speech in the original language, capped at 5000 characters. Preserve qualifiers, dates, numbers, speaker attributions and meaningful wording. Mark genuinely unclear words as [unclear] instead of guessing. Do not summarize the transcript. Then extract at most ${MAX_CLAIMS} short, atomic, checkable factual claims from that speech. Ignore opinions, jokes, predictions, and unsupported implications. Do not infer claims from images, facial expressions, edits or on-screen graphics; visual-only claims are out of scope for this pass. Never strengthen a speaker's claim. Return only JSON with this shape: {"creator":string,"title":string,"transcript":string,"claims":[{"text":string,"category":"health"|"engineering"|"general"}]}. If no audible speech is present, transcript must be an empty string. If no checkable spoken claims exist, claims must be [].` }]}], {
+      responseMimeType: 'application/json', maxOutputTokens: 2500
+    });
+  const ext = parseJsonResponse(extResponse);
+  if (!ext || typeof ext !== 'object' || Array.isArray(ext)) throw new Error('The AI returned an invalid transcript response. Please retry.');
+  const transcript = typeof ext.transcript === 'string' ? ext.transcript.trim().slice(0, 5000) : '';
+  const claims = Array.isArray(ext.claims) ? ext.claims.slice(0, MAX_CLAIMS).filter(c => typeof c?.text === 'string' && c.text.trim()).map(c => ({
+    text: c.text.trim().slice(0, 700),
+    category: ['health', 'engineering', 'general'].includes(c.category) ? c.category : 'general'
+  })) : [];
+  const base = {creator: String(ext.creator || '').slice(0, 120), title: String(ext.title || '').slice(0, 200)};
+  if (!claims.length) return {
+    verdict: 'Insufficient Evidence', confidence: 0,
+    explanation: 'No checkable factual claims were extracted from the spoken content.', claims: [], misleading: [], nextSteps: [],
+    limitations: 'This pass prioritizes spoken claims. Visual-only claims, on-screen text, and audio/video forensic authenticity were not assessed.',
+    ...base, transcript, sources: [], pipelineVersion: PIPELINE_VERSION
+  };
+
+  // Call 2: one grounded request verifies all claims and returns the final report directly.
+  // This replaces up to three category-agent calls plus a separate synthesis call.
+  const compactClaims = claims.map((c, i) => `${i + 1}. [${c.category}] ${c.text}`).join('\n');
+  const verifyResponse = await generate(ai, model, [{role: 'user', parts: [{text:
+    `You are a rigorous fact-checking analyst. Use Google Search grounding to verify each claim independently. Prefer primary sources and relevant authoritative sources: health—WHO/CDC/NHS/systematic reviews; engineering—standards bodies, peer-reviewed research, government or university sources; general—primary documents, official data and reputable reporting. Do not treat search snippets alone as conclusive. Preserve the claim's original scope and qualifiers. If sources conflict or evidence is weak, use Insufficient Evidence or Mixed. Do not claim a video is a deepfake or authentic: this pipeline does not run forensic authenticity detection.\n\nClaims:\n${compactClaims}\n\nReturn a concise JSON report: {"verdict": one of [${VERDICTS}], "confidence": integer 0-100 (strength of assessment, not probability of truth), "explanation": string, "claims": [{"text": string, "verdict": one of [${VERDICTS}], "explanation": string}], "misleading": [short strings; empty if none], "nextSteps": [2-3 short actions], "limitations": string}. Keep explanations concise. Mention material evidence gaps. Do not invent sources; cite URLs in the explanation only when available from grounding. Include no more than 8 unique grounded sources in the final report.`}]}], {
+      tools: [{googleSearch: {}}], responseMimeType: 'application/json', maxOutputTokens: 3000
+    });
+  const rep = parseJsonResponse(verifyResponse);
+  const grounding = verifyResponse.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+  const sources = [...new Map(grounding.filter(g => g?.web?.uri).map(g => [g.web.uri, {uri: g.web.uri, title: g.web.title || g.web.uri}])).values()].slice(0, 8);
+  const validVerdicts = new Set(['Supported', 'Contradicted', 'Misleading', 'Mixed', 'Insufficient Evidence']);
+  const claimResults = Array.isArray(rep.claims) ? rep.claims.slice(0, MAX_CLAIMS).map((c, i) => ({
+    text: String(c?.text || claims[i]?.text || '').slice(0, 700),
+    verdict: validVerdicts.has(c?.verdict) ? c.verdict : 'Insufficient Evidence',
+    explanation: String(c?.explanation || 'No claim-level explanation was returned.').slice(0, 1200)
+  })) : claims.map(c => ({text: c.text, verdict: 'Insufficient Evidence', explanation: 'The model did not return a claim-level assessment.'}));
+  const overall = validVerdicts.has(rep.verdict) ? rep.verdict : 'Insufficient Evidence';
+  return {
+    verdict: overall,
+    confidence: Math.max(0, Math.min(100, Number.isFinite(Number(rep.confidence)) ? Math.round(Number(rep.confidence)) : 0)),
+    explanation: String(rep.explanation || 'Insufficient explanation returned.').slice(0, 3000),
+    claims: claimResults,
+    misleading: Array.isArray(rep.misleading) ? rep.misleading.slice(0, 5).map(x => String(x).slice(0, 300)) : [],
+    nextSteps: Array.isArray(rep.nextSteps) ? rep.nextSteps.slice(0, 3).map(x => String(x).slice(0, 300)) : [],
+    limitations: [String(rep.limitations || ''), 'Transcript-first pass: visual-only claims, on-screen text, and audio/video forensic authenticity were not assessed. The transcript is AI-generated and may contain recognition errors.'].filter(Boolean).join(' '),
+    ...base, transcript, sources, pipelineVersion: PIPELINE_VERSION
+  };
+}
+
+async function job(id, ai, src, meta, k, model) {
+  try {
+    const r = await analyse(ai, src, model);
+    await db.doc(`reports/${id}`).set({...r, ...meta, id, model, status: 'done', updatedAt: Date.now()});
+  } catch (e) {
+    const m = publicAiError(e, k);
+    console.error('Analysis failed:', m);
+    await db.doc(`reports/${id}`).set({id, ...meta, model, status: 'error', error: m, updatedAt: Date.now(), pipelineVersion: PIPELINE_VERSION});
+  } finally {
+    inFlight.delete(id);
+  }
 }
 
 const ytId = u => {
@@ -115,26 +197,46 @@ app.post('/api/seed', async (_, res) => { // optional bulk import: gs://BUCKET/d
 });
 
 app.post('/api/check-key', async (req, res) => {
+  const model = modelOf(req);
+  if (!model) return res.status(400).json({ok: false, error: 'Unsupported Gemini model.'});
   const ai = clientFor(req); if (!ai) return res.status(401).json({ok: false, needKey: true, error: 'No key provided.'});
-  try { await ai.models.generateContent({model: MODEL, contents: 'Reply with OK', config: {maxOutputTokens: 16}}); res.json({ok: true}); }
-  catch (e) { res.status(400).json({ok: false, error: clean(e, keyOf(req))}); }
+  try { await ai.models.generateContent({model, contents: 'Reply with OK', config: {maxOutputTokens: 16}}); res.json({ok: true}); }
+  catch (e) { res.status(isQuotaError(e) ? 429 : 400).json({ok: false, error: publicAiError(e, keyOf(req))}); }
 });
 
 app.post('/api/analyse', async (req, res) => {
-  const {postId, url} = req.body || {}; let id, src, meta;
+  const {postId, url} = req.body || {};
+  const model = modelOf(req);
+  if (!model) return res.status(400).json({error: 'Unsupported Gemini model.'});
+  let sourceId, src, meta;
   if (postId) {
-    const p = (await db.doc(`posts/${String(postId)}`).get()).data(), name = p && nameOf(p); if (!name) return res.status(404).json({error: 'Video not found.'});
-    id = p.id; src = {name, mime: p.mime || 'video/mp4'}; meta = {creator: p.creator, title: p.title, postId: p.id};
+    const p = (await db.doc(`posts/${String(postId)}`).get()).data(), name = p && nameOf(p);
+    if (!name) return res.status(404).json({error: 'Video not found.'});
+    sourceId = p.id; src = {name, mime: p.mime || 'video/mp4'};
+    meta = {creator: p.creator, title: p.title, postId: p.id};
   } else {
-    const v = ytId(String(url || '')); if (!v) return res.status(400).json({error: 'Only public YouTube links are supported for now (youtube.com or youtu.be).'});
-    const canon = `https://www.youtube.com/watch?v=${v}`; id = hash(canon); src = {youtube: canon}; meta = {url: canon};
+    const v = ytId(String(url || ''));
+    if (!v) return res.status(400).json({error: 'Only public YouTube links are supported for now (youtube.com or youtu.be).'});
+    const canon = `https://www.youtube.com/watch?v=${v}`;
+    sourceId = hash(canon); src = {youtube: canon}; meta = {url: canon};
   }
+  meta = {...meta, sourceId};
+  const id = hash(`${sourceId}:${model}`);
   const old = (await db.doc(`reports/${id}`).get()).data();
-  if (old && (old.status === 'done' || (old.status === 'processing' && Date.now() - old.updatedAt < 300000))) return res.json({id, cached: old.status === 'done'});
+  if (old?.status === 'done' && old.pipelineVersion === PIPELINE_VERSION && old.model === model) return res.json({id, cached: true});
+  if (inFlight.has(id) || (old?.status === 'processing' && old.pipelineVersion === PIPELINE_VERSION && Date.now() - Number(old.updatedAt || 0) < 300000)) {
+    return res.json({id, cached: false, processing: true});
+  }
   const ai = clientFor(req);
   if (!ai) return res.status(401).json({error: 'An AI key is required. Add one in Settings.', needKey: true});
-  await db.doc(`reports/${id}`).set({id, status: 'processing', ...meta, updatedAt: Date.now()});
-  res.json({id}); job(id, ai, src, meta, keyOf(req)); // background work: deploy with --no-cpu-throttling
+  inFlight.set(id, true);
+  await db.doc(`reports/${id}`).set({id, sourceId, model, status: 'processing', ...meta, updatedAt: Date.now(), pipelineVersion: PIPELINE_VERSION});
+  res.json({id, cached: false, processing: true});
+  // Background work requires Cloud Run CPU to remain available after the response.
+  void job(id, ai, src, meta, keyOf(req), model).catch(e => {
+    inFlight.delete(id);
+    console.error('Unexpected background-job failure:', publicAiError(e, keyOf(req)));
+  });
 });
 
 app.get('/api/reports', async (_, res) => res.json((await db.collection('reports').orderBy('updatedAt', 'desc').limit(50).get()).docs.map(d => d.data())));

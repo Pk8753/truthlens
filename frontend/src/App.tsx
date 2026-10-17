@@ -2,9 +2,25 @@ import {useCallback, useEffect, useRef, useState} from 'react';
 
 type Post = {id: string; creator: string; title: string; caption?: string; videoUrl: string};
 type Claim = {text: string; verdict: string; explanation: string};
-type Report = {id: string; status: 'processing' | 'done' | 'error'; creator?: string; title?: string; url?: string; postId?: string; verdict?: string; confidence?: number; explanation?: string; claims?: Claim[]; sources?: {uri: string; title: string}[]; misleading?: string[]; nextSteps?: string[]; limitations?: string; error?: string; updatedAt?: number};
+type Report = {id: string; status: 'processing' | 'done' | 'error'; creator?: string; title?: string; url?: string; postId?: string; sourceId?: string; model?: string; verdict?: string; confidence?: number; explanation?: string; claims?: Claim[]; sources?: {uri: string; title: string}[]; misleading?: string[]; nextSteps?: string[]; limitations?: string; transcript?: string; transcriptSummary?: string; error?: string; updatedAt?: number};
 type ToastFn = (msg: string, kind?: 'ok' | 'err') => void;
 type Prov = 'gemini' | 'vertex';
+
+const MODEL_OPTIONS = [
+  {id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash'},
+  {id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash'},
+  {id: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite'},
+  {id: 'gemini-3.5-flash-lite-preview', label: 'Gemini 3.5 Flash Lite Preview'},
+  {id: 'gemini-3.1-flash-lite-preview', label: 'Gemini 3.1 Flash Lite Preview'},
+  {id: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview'},
+  {id: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash Lite'},
+  {id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash'},
+  {id: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite'}
+] as const;
+type ModelId = typeof MODEL_OPTIONS[number]['id'];
+const DEFAULT_MODEL: ModelId = 'gemini-3.8-flash';
+const getModel = (): ModelId => MODEL_OPTIONS.find(m => m.id === localStorage.getItem('ai_model'))?.id || DEFAULT_MODEL;
+const normalizeModel = (value: string): ModelId => MODEL_OPTIONS.find(m => m.id === value)?.id || DEFAULT_MODEL;
 
 /* ---------- keys: sessionStorage by default, localStorage only if "remember" is ticked ---------- */
 const PROV: Prov[] = ['gemini', 'vertex'];
@@ -12,7 +28,7 @@ const getKey = (p: Prov) => localStorage.getItem('ai_key_' + p) || sessionStorag
 const setKey = (p: Prov, k: string, remember: boolean) => { localStorage.removeItem('ai_key_' + p); sessionStorage.removeItem('ai_key_' + p); if (k) (remember ? localStorage : sessionStorage).setItem('ai_key_' + p, k); };
 const active = (): Prov => { const a = localStorage.getItem('ai_active') as Prov; return a && getKey(a) ? a : PROV.find(getKey) || 'gemini'; };
 const api = async (path: string, body?: unknown) => {
-  const p = active(), k = getKey(p); const h: Record<string, string> = {'Content-Type': 'application/json'};
+  const p = active(), k = getKey(p); const h: Record<string, string> = {'Content-Type': 'application/json', 'x-ai-model': getModel()};
   if (k) { h['x-ai-key'] = k; h['x-ai-provider'] = p; }
   try { const r = await fetch('/api' + path, {method: body ? 'POST' : 'GET', headers: h, body: body ? JSON.stringify(body) : undefined}); return await r.json(); }
   catch { return {error: 'Could not reach the server. Check your connection.'}; }
@@ -32,14 +48,111 @@ const ytThumb = (u?: string) => { const m = u?.match(/(?:v=|youtu\.be\/)([\w-]{1
 const ytOk = (u: string) => /^https?:\/\/(www\.|m\.)?(youtube\.com\/(watch\?v=|shorts\/|embed\/)[\w-]{11}|youtu\.be\/[\w-]{11})/.test(u.trim());
 const when = (t?: number) => (t ? new Date(t).toLocaleString() : '');
 
+type KeyFrame = {timestamp: number; dataUrl: string};
+const formatMediaTime = (time: number) => {
+  const seconds = Math.max(0, Math.floor(time));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+};
+
+/** Extract a few real frames in the browser from TruthLens-hosted video media.
+ *  This uses the same-origin /api/video endpoint; it does not attempt to capture
+ *  pixels from YouTube's cross-origin player or send screenshots back to Gemini.
+ */
+async function extractKeyFrames(videoUrl: string): Promise<KeyFrame[]> {
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.setAttribute('aria-hidden', 'true');
+  Object.assign(video.style, {
+    position: 'fixed', left: '-10000px', top: '0', width: '320px', height: '180px',
+    opacity: '0', pointerEvents: 'none'
+  });
+  document.body.appendChild(video);
+
+  const waitFor = (eventName: 'loadedmetadata' | 'seeked', timeoutMs: number) => new Promise<void>((resolve, reject) => {
+    const finish = (err?: Error) => {
+      window.clearTimeout(timer);
+      video.removeEventListener(eventName, onEvent);
+      video.removeEventListener('error', onError);
+      if (err) reject(err); else resolve();
+    };
+    const onEvent = () => finish();
+    const onError = () => finish(new Error('The browser could not decode this video.'));
+    const timer = window.setTimeout(() => finish(new Error('Timed out while reading video frames.')), timeoutMs);
+    video.addEventListener(eventName, onEvent, {once: true});
+    video.addEventListener('error', onError, {once: true});
+  });
+
+  try {
+    const loaded = waitFor('loadedmetadata', 15000);
+    video.src = videoUrl;
+    video.load();
+    await loaded;
+    const duration = video.duration;
+    if (!Number.isFinite(duration) || duration <= 0 || !video.videoWidth || !video.videoHeight) return [];
+
+    const marks = [...new Set([0.08, 0.33, 0.58, 0.83].map(ratio =>
+      Number(Math.max(0, Math.min(Math.max(duration - 0.05, 0), duration * ratio)).toFixed(2))
+    ))];
+    const frames: KeyFrame[] = [];
+    for (const timestamp of marks) {
+      try {
+        const sought = waitFor('seeked', 7000);
+        video.currentTime = timestamp;
+        await sought;
+        if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) continue;
+        const width = Math.min(640, video.videoWidth);
+        const height = Math.max(1, Math.round(width * video.videoHeight / video.videoWidth));
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const context = canvas.getContext('2d');
+        if (!context) continue;
+        context.drawImage(video, 0, 0, width, height);
+        frames.push({timestamp, dataUrl: canvas.toDataURL('image/jpeg', 0.72)});
+      } catch {
+        // A single failed seek should not prevent other representative frames.
+      }
+    }
+    return frames;
+  } finally {
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    video.remove();
+  }
+}
+
 /* ---------- report modal (real data only; polls the backend) ---------- */
 function ReportModal({id, onClose}: {id: string; onClose: () => void}) {
   const [r, setR] = useState<Report>(); const [sec, setSec] = useState(0);
+  const [frames, setFrames] = useState<KeyFrame[]>([]);
+  const [framesLoading, setFramesLoading] = useState(false);
+  const [framesError, setFramesError] = useState('');
   useEffect(() => {
     let t: number, dead = false; const tick = async () => { const d: Report = await api('/reports/' + id); if (dead) return; setR(d); if (d.status === 'processing') t = window.setTimeout(tick, 3000); };
     tick(); const c = window.setInterval(() => setSec(s => s + 1), 1000); return () => { dead = true; clearTimeout(t); clearInterval(c); };
   }, [id]);
   useEffect(() => { const k = (e: KeyboardEvent) => e.key === 'Escape' && onClose(); window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, [onClose]);
+  const reportId = r?.id;
+  const reportStatus = r?.status;
+  const reportPostId = r?.postId;
+  useEffect(() => {
+    let cancelled = false;
+    setFrames([]);
+    setFramesError('');
+    if (!reportId || reportStatus !== 'done' || !reportPostId) {
+      setFramesLoading(false);
+      return () => { cancelled = true; };
+    }
+    setFramesLoading(true);
+    extractKeyFrames(`/api/video/${encodeURIComponent(reportPostId)}`)
+      .then(items => { if (!cancelled) setFrames(items); })
+      .catch(() => { if (!cancelled) setFramesError('Frames could not be extracted in this browser. The transcript above is still available.'); })
+      .finally(() => { if (!cancelled) setFramesLoading(false); });
+    return () => { cancelled = true; };
+  }, [reportId, reportStatus, reportPostId]);
   const busy = !r || r.status === 'processing';
   return (
     <div className="modal" onClick={onClose} role="dialog" aria-modal="true" aria-label="Analysis report"><div className="sheet" onClick={e => e.stopPropagation()}>
@@ -60,6 +173,27 @@ function ReportModal({id, onClose}: {id: string; onClose: () => void}) {
         {r.sources?.length ? <ul>{r.sources.map(s => <li key={s.uri}><a href={s.uri} target="_blank" rel="noreferrer noopener">{s.title}</a></li>)}</ul> : <p className="mu small">No sources were retrieved, so treat this assessment with extra caution.</p>}
         {!!r.nextSteps?.length && <><h3>Recommended next steps</h3><ul>{r.nextSteps.map((m, i) => <li key={i}>{m}</li>)}</ul></>}
         {r.limitations && <><h3>Limitations</h3><p className="mu small">{r.limitations}</p></>}
+        <section aria-label="Transcript and key-frame evidence" style={{marginTop: 24, paddingTop: 18, borderTop: '1px solid #e5e5e7'}}>
+          <h3 style={{marginTop: 0}}>Transcript &amp; key frames</h3>
+          <p className="mu small" style={{marginTop: -4}}>AI-generated transcript for review. It can contain recognition errors and should be checked against the original video.</p>
+          <h4 style={{margin: '16px 0 8px'}}>Transcript</h4>
+          {r.transcript?.trim()
+            ? <pre style={{whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 360, overflowY: 'auto', margin: 0, padding: 14, borderRadius: 12, border: '1px solid #e5e5e7', background: '#f7f7f8', color: '#242428', fontFamily: 'inherit', fontSize: 14, lineHeight: 1.6}}>{r.transcript}</pre>
+            : <p className="mu small">No transcript text was returned for this video. This may mean speech was absent, unclear, or not transcribed successfully.</p>}
+          <h4 style={{margin: '18px 0 8px'}}>Key-frame screenshots</h4>
+          {r.postId
+            ? framesLoading
+              ? <p className="mu small">Extracting representative frames from the video…</p>
+              : frames.length
+                ? <div style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10}}>
+                    {frames.map((frame, i) => <figure key={`${frame.timestamp}-${i}`} style={{margin: 0, minWidth: 0}}>
+                      <img src={frame.dataUrl} alt={`Video frame at ${formatMediaTime(frame.timestamp)}`} loading="lazy" style={{display: 'block', width: '100%', aspectRatio: '16 / 9', objectFit: 'contain', background: '#111', borderRadius: 10, border: '1px solid #e5e5e7'}} />
+                      <figcaption className="mu small" style={{marginTop: 5}}>Frame at {formatMediaTime(frame.timestamp)}</figcaption>
+                    </figure>)}
+                  </div>
+                : <p className="mu small">{framesError || 'No usable key frames could be extracted from this video.'}</p>
+            : <p className="mu small">Key-frame screenshots are available for videos stored in the TruthLens feed. For public YouTube URL analyses, the transcript is shown here; this app does not capture screenshots from YouTube’s embedded player.</p>}
+        </section>
       </>}
     </div></div>
   );
@@ -69,6 +203,7 @@ function ReportModal({id, onClose}: {id: string; onClose: () => void}) {
 function Settings({onClose, toast}: {onClose: () => void; toast: ToastFn}) {
   const [vals, setVals] = useState<Record<Prov, string>>({gemini: getKey('gemini'), vertex: getKey('vertex')});
   const [rem, setRem] = useState(!!(localStorage.getItem('ai_key_gemini') || localStorage.getItem('ai_key_vertex')));
+  const [model, setModel] = useState<ModelId>(getModel);
   const [act, setAct] = useState<Prov>(active()); const [st, setSt] = useState<Record<string, string>>({});
   useEffect(() => { const k = (e: KeyboardEvent) => e.key === 'Escape' && onClose(); window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, [onClose]);
   const save = (p: Prov) => { const k = vals[p].trim(); if (k.length < 20) return toast('That key looks too short.', 'err'); setKey(p, k, rem); localStorage.setItem('ai_active', p); setAct(p); setSt(s => ({...s, [p]: 'Saved. Not verified yet.'})); toast('Key saved in this browser.'); };
@@ -88,6 +223,11 @@ function Settings({onClose, toast}: {onClose: () => void; toast: ToastFn}) {
     <div className="modal" onClick={onClose} role="dialog" aria-modal="true" aria-label="AI Configuration"><div className="sheet" onClick={e => e.stopPropagation()}>
       <div className="row"><h2 className="sec" style={{fontSize: 28, margin: 0}}>AI Configuration</h2><button className="icon-btn" onClick={onClose} aria-label="Close"><Ic n="x" /></button></div>
       <p className="mu small">Your key is sent only with analysis requests and is never stored on the server. If no key is set here, the server’s own key (if configured) is used.</p>
+      <label className="l" htmlFor="ai-model">Analysis model</label>
+      <select id="ai-model" className="field" value={model} onChange={e => { const next = normalizeModel(e.target.value); setModel(next); localStorage.setItem('ai_model', next); }}>
+        {MODEL_OPTIONS.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+      </select>
+      <p className="mu small">This model is used for key checks and video analyses. Availability depends on your Gemini or Vertex project.</p>
       {card('gemini', 'Option A · Google AI Studio / Gemini', 'Gemini API Key', <>Create one at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer noopener">aistudio.google.com/apikey</a>.</>)}
       {card('vertex', 'Option B · Vertex AI', 'Vertex AI API Key', <>Must be a Vertex AI API key (express mode) compatible with this backend. Not every Vertex credential works as an API key. Use “Test with server” to confirm.</>)}
       <label className="small" style={{display: 'flex', gap: 8, marginTop: 16, alignItems: 'flex-start'}}><input type="checkbox" checked={rem} onChange={e => setRem(e.target.checked)} />
@@ -208,7 +348,7 @@ export default function App() {
   const loadPosts = useCallback(async (): Promise<Post[]> => { const d = await api('/posts'); setLoadP(false); if (Array.isArray(d)) { setPosts(d); return d; } toast(d.error || 'Could not load videos.', 'err'); return []; }, [toast]);
   const loadReports = useCallback(async () => { const d = await api('/reports'); if (Array.isArray(d)) setReports(d); setLoadR(false); }, []);
   useEffect(() => { loadPosts(); loadReports(); }, [loadPosts, loadReports]);
-  const repOf = (id: string) => reports.find(r => r.id === id);
+  const repOf = (id: string) => reports.find(r => r.sourceId === id || r.postId === id || r.id === id);
   const toDemo = (t: 'feed' | 'url') => { setTab(t); setTimeout(() => document.getElementById('demo')?.scrollIntoView({behavior: 'smooth'}), 60); };
   const start = async (body: object, pid = '') => {
     setBusy(pid || 'url'); const d = await api('/analyse', body); setBusy('');

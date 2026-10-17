@@ -30,29 +30,19 @@ cd ../frontend && npm install && npm run dev   # UI on :5173 (proxies /api)
 
 ## Deploy to Google Cloud Run
 ```bash
-PROJECT_ID=$(gcloud config get-value project)
-BUCKET=${PROJECT_ID}-truthlens-videos
-SA=$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')-compute@developer.gserviceaccount.com
-
-gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com
-gcloud firestore databases create --location=us-central1
-gcloud storage buckets create gs://$BUCKET --location=us-central1 --uniform-bucket-level-access
-for R in datastore.user storage.objectAdmin; do
-  gcloud projects add-iam-policy-binding $PROJECT_ID --member=serviceAccount:$SA --role=roles/$R
-done
-
-gcloud run deploy truthlens --source . --region us-central1 --allow-unauthenticated \
-  --max-instances 2 --memory 1Gi --no-cpu-throttling --timeout=300 \
-  --set-env-vars BUCKET=$BUCKET
+bash deploy.sh
 ```
+The script uses the active `gcloud` project and deploys to `us-central1` by default. It enables the required APIs, creates the default Firestore database and video bucket only when they do not already exist, grants the Cloud Run service account the required roles, then deploys the service. Override defaults with `PROJECT_ID`, `REGION`, `BUCKET`, or `SERVICE`, for example `PROJECT_ID=my-project REGION=us-east1 bash deploy.sh`.
 Open the service URL, click the gear icon, paste a Gemini key ([aistudio.google.com/apikey](https://aistudio.google.com/apikey)), and use **Test with server**.
 
 ## Configuration
 | Variable | Purpose |
 |---|---|
 | `BUCKET` | Cloud Storage bucket for uploaded videos (required) |
-| `MODEL` | Gemini model, default `gemini-2.5-flash` |
+| `MODEL` | Server fallback model when no model is sent; default `gemini-3.8-flash`. The frontend model selection takes precedence. |
 | `GEMINI_API_KEY` | Optional server fallback key; a visitor's own key always takes priority |
+
+Choose the analysis model in **Settings → Analysis model**. The selection is saved in this browser and used for both key checks and analyses. The available choices are Gemini 3.8 Flash, Gemini 2.5 Flash, Gemini 2.5 Flash Lite, Gemini 3 Flash, Gemini 3.1 Flash Lite, and Gemini 3.5 Flash Lite. Model access depends on the selected provider and project.
 
 ## Notes and limits
 - `--no-cpu-throttling` is required so analysis continues after the API replies.

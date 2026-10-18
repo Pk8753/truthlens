@@ -327,7 +327,7 @@ if (staticDir) {
   app.get('*', (_, res) => res.status(200).send(`<!DOCTYPE html><html><head><title>TruthLens API Server</title></head><body style="font-family:system-ui,sans-serif;background:#0b0f19;color:#f1f5f9;padding:40px"><h2>TruthLens Backend API Running</h2><p>The backend API is active on <code>http://localhost:${PORT}/api</code>.</p></body></html>`));
 }
 
-app.listen(PORT, () => {
-  console.log(`TruthLens backend listening on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`TruthLens backend listening on port ${PORT}`);
   console.log(`  Audio Lab: ${FEATURE_AUDIO_ENABLED ? 'ENABLED' : 'DISABLED (set FEATURE_AUDIO_ENABLED=true to enable)'}`);
 });

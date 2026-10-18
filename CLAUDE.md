@@ -1,6 +1,6 @@
 # Claude Code Guidance — TruthLens
 
-Refer to [AGENTS.md](file:///c:/Users/khanm/code/ai-builder-cup/truthlens/AGENTS.md) for complete architecture, conventions, security rules, and engineering standards.
+Refer to [AGENTS.md](./AGENTS.md) for complete architecture, conventions, security rules, and engineering standards.
 
 ## Quick Reference Commands
 - **Backend syntax check**: `node --check backend/server.js`
